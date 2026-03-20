@@ -1,0 +1,86 @@
+name: Obsidian Sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'exports/latest.json'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (do not push to vault repo)'
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    name: Sync to Obsidian vault
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout cockpit repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate export file
+        run: |
+          if [ ! -f exports/latest.json ]; then
+            echo "❌ exports/latest.json not found"
+            exit 1
+          fi
+          node -e "
+            const s = require('./exports/latest.json');
+            const required = ['insights','opportunities','experiments','decisionLog','scoringWeights','lastUpdated'];
+            const missing = required.filter(k => !(k in s));
+            if (missing.length) { console.error('Missing keys:', missing); process.exit(1); }
+            console.log('✓ Valid export — lastUpdated:', s.lastUpdated);
+            console.log('  insights:', s.insights.length);
+            console.log('  opportunities:', s.opportunities.length);
+            console.log('  experiments:', s.experiments.length);
+            console.log('  decisions:', s.decisionLog.length);
+          "
+
+      - name: Clone Obsidian vault repo
+        env:
+          OBSIDIAN_TOKEN: ${{ secrets.OBSIDIAN_TOKEN }}
+          OBSIDIAN_REPO: ${{ vars.OBSIDIAN_REPO }}
+        run: |
+          git clone "https://x-access-token:${OBSIDIAN_TOKEN}@github.com/${OBSIDIAN_REPO}.git" vault-repo
+
+      - name: Run obsidian-sync
+        env:
+          OBSIDIAN_VAULT_PATH: ${{ vars.OBSIDIAN_VAULT_PATH || 'microentr' }}
+        run: |
+          mkdir -p "vault-repo/${OBSIDIAN_VAULT_PATH}"
+          node scripts/obsidian-sync.js \
+            --input exports/latest.json \
+            --vault "vault-repo/${OBSIDIAN_VAULT_PATH}"
+
+      - name: Commit and push to vault repo
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          OBSIDIAN_REPO: ${{ vars.OBSIDIAN_REPO }}
+          OBSIDIAN_VAULT_PATH: ${{ vars.OBSIDIAN_VAULT_PATH || 'microentr' }}
+        run: |
+          cd vault-repo
+          git config user.name  "microentr-bot"
+          git config user.email "microentr-bot@users.noreply.github.com"
+          git add "${OBSIDIAN_VAULT_PATH}/"
+          if git diff --cached --quiet; then
+            echo "⏭ No changes to commit — vault is already up to date."
+          else
+            EXPORT_DATE=$(node -e "console.log(require('../exports/latest.json').lastUpdated.split('T')[0])")
+            git commit -m "sync: microentr cockpit → ${EXPORT_DATE}"
+            git push
+            echo "✓ Vault updated."
+          fi
+
+      - name: Dry run summary
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "Dry run — skipped push. Generated files:"
+          find vault-repo -name '*.md' | sort
